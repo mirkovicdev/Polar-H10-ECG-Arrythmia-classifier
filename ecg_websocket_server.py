@@ -82,6 +82,8 @@ class ECGWebSocketServer:
             return
         
         try:
+            if len(self.ecg_data) == 0:
+                self.start_time = time.time()
             samples_extracted = 0
             current_time = time.time() - self.start_time
             
@@ -212,6 +214,9 @@ class ECGWebSocketServer:
             if command == "connect":
                 print("📡 Received connect command from client")
                 if not self.is_connected:
+                    self.start_time = time.time()  # Reset timer
+                    self.ecg_data.clear()  # ADD THIS
+                    self.ecg_times.clear()  # ADD THIS
                     success = await self.scan_and_connect()
                     if success:
                         await self.start_ecg_stream()

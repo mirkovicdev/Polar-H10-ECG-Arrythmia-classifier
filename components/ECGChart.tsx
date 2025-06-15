@@ -1,3 +1,5 @@
+// Components/ECGChart.tsx
+
 'use client'
 
 import React, { useState, useEffect, useRef } from 'react'
@@ -14,6 +16,7 @@ import {
 } from 'chart.js'
 import { Line } from 'react-chartjs-2'
 import { ImprovedPVCDetector, PVCEvent } from '@/utils/PVCDetector'
+import { BurdenCalculator } from '@/utils/burden'
 
 // Register Chart.js components
 ChartJS.register(
@@ -52,7 +55,10 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   const [pvcEvents, setPvcEvents] = useState<PVCEvent[]>([])
   const [sampleCount, setSampleCount] = useState(0)
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
+  const [burdenStats, setBurdenStats] = useState({ burden: 0, burdenCategory: 'low' })
   const pvcDetectorRef = useRef(new ImprovedPVCDetector(130))
+  const [prevPvcCount, setPrevPvcCount] = useState(0)
+
 
   // WebSocket connection
   useEffect(() => {
@@ -89,6 +95,18 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
               if (result.heartRate > 0) setHeartRate(result.heartRate)
               setPvcCount(result.pvcCount)
               setPvcEvents(result.pvcEvents) // Update PVC events
+              if (result.pvcCount !== prevPvcCount) {
+                setBurdenStats(BurdenCalculator.calculateBurden(result.totalBeats, result.pvcCount))
+                setPrevPvcCount(result.pvcCount)
+                console.log('🔍 Burden Calculation:', {
+                  expectedBeats: result.totalBeats,
+                  detectedBeats: result.detectedBeats,
+                  pvcCount: result.pvcCount,
+                  timeSpanSeconds: result.timeSpanMs / 1000,
+                  heartRate: result.heartRate,
+                  burden: ((result.pvcCount / result.totalBeats) * 100).toFixed(1) + '%'
+                })
+              }
               
               // DEBUG: Log when PVC detected
               if (result.pvcEvents.length > 0) {
@@ -112,7 +130,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
             })
             
             setSampleCount(prev => prev + newSamples.length)
-            
+
           } else if (data.type === 'status') {
             const connected = data.connected as boolean
             onConnectionChange(connected)
@@ -158,6 +176,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
     pvcDetectorRef.current.reset()
     setPvcCount(0)
     setPvcEvents([])
+    setPrevPvcCount(0)
     sendCommand('connect')
   }
 
@@ -353,6 +372,9 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
             </span>
             <span>❤️ {heartRate > 0 ? heartRate.toFixed(0) : '--'} BPM</span>
             <span>⚡ PVCs: {pvcCount}</span>
+            <span className={BurdenCalculator.getBurdenColor(burdenStats.burdenCategory as 'low' | 'moderate' | 'high')}>
+              📊 {BurdenCalculator.formatBurden(burdenStats.burden)} burden
+            </span>
           </div>
           <div className="flex items-center space-x-4">
             <span>Samples: {sampleCount.toLocaleString()}</span>
