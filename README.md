@@ -192,7 +192,7 @@ cd Polar-H10-ECG-Arrythmia-classifier
 # Setup Python environment
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install asyncio websockets numpy bleak scikit-learn
+pip install -r requirements.txt
 
 # Setup Node.js dependencies
 npm install
