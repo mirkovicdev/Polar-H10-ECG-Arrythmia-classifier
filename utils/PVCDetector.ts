@@ -1,10 +1,18 @@
-// utils/PVCDetector.ts - MINIMAL FIX (KEEP WORKING BPM!)
+// utils/PVCDetector.ts - MINIMAL FIX (KEEP WORKING BPM!) + PVC Events
+
+export interface PVCEvent {
+  timestamp: number;
+  currentRR: number;
+  expectedRR: number;
+  percentagePremature: number;
+}
 
 export interface PVCDetectionResult {
   pvcCount: number;
   totalBeats: number;
   heartRate: number;
   isPVC: boolean;
+  pvcEvents: PVCEvent[];
 }
 
 export class ImprovedPVCDetector {
@@ -13,6 +21,7 @@ export class ImprovedPVCDetector {
   private rPeaks: number[] = []
   private pvcCount = 0
   private lastPvcTime = 0
+  private pvcEvents: PVCEvent[] = [] // Store PVC events
 
   constructor(samplingRate: number = 130) {
     // Simple constructor
@@ -71,8 +80,10 @@ export class ImprovedPVCDetector {
       
       // Keep only recent peaks (last 30 seconds)
       this.rPeaks = this.rPeaks.filter(t => peakTime - t < 30000)
+      // Clean old PVC events too
+      this.pvcEvents = this.pvcEvents.filter(e => peakTime - e.timestamp < 30000)
       
-      // ONLY CHANGE: More conservative PVC detection
+      // ONLY CHANGE: More conservative PVC detection + store events
       if (this.rPeaks.length > 5) { // Need at least 6 beats
         const rrIntervals = []
         for (let i = 1; i < this.rPeaks.length; i++) {
@@ -92,6 +103,15 @@ export class ImprovedPVCDetector {
         if (veryPremature && physiologicalLimits && notTooFrequent) {
           this.pvcCount++
           this.lastPvcTime = peakTime
+          
+          // Store PVC event details
+          const percentagePremature = Math.round((1 - currentRR / medianRR) * 100)
+          this.pvcEvents.push({
+            timestamp: peakTime,
+            currentRR,
+            expectedRR: medianRR,
+            percentagePremature
+          })
         }
       }
     })
@@ -115,7 +135,8 @@ export class ImprovedPVCDetector {
       pvcCount: this.pvcCount,
       totalBeats: this.rPeaks.length,
       heartRate: heartRate,
-      isPVC: false // Not tracking individual beats
+      isPVC: false, // Not tracking individual beats
+      pvcEvents: [...this.pvcEvents] // Return copy of events
     }
   }
 
@@ -125,5 +146,6 @@ export class ImprovedPVCDetector {
     this.rPeaks = []
     this.pvcCount = 0
     this.lastPvcTime = 0
+    this.pvcEvents = [] // Reset events
   }
 }

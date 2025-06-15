@@ -13,8 +13,7 @@ import {
   ChartOptions,
 } from 'chart.js'
 import { Line } from 'react-chartjs-2'
-import { ImprovedPVCDetector } from '@/utils/PVCDetector'
-
+import { ImprovedPVCDetector, PVCEvent } from '@/utils/PVCDetector'
 
 // Register Chart.js components
 ChartJS.register(
@@ -34,6 +33,7 @@ interface ECGChartProps {
 
 export default function ECGChart({ isConnected, onConnectionChange }: ECGChartProps) {
   const chartRef = useRef<ChartJS<'line'>>(null)
+  const chartContainerRef = useRef<HTMLDivElement>(null)
   const websocketRef = useRef<WebSocket | null>(null)
   
   const [allEcgData, setAllEcgData] = useState<number[]>([])
@@ -49,11 +49,12 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   // Statistics
   const [heartRate, setHeartRate] = useState(0)
   const [pvcCount, setPvcCount] = useState(0)
+  const [pvcEvents, setPvcEvents] = useState<PVCEvent[]>([])
   const [sampleCount, setSampleCount] = useState(0)
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
   const pvcDetectorRef = useRef(new ImprovedPVCDetector(130))
 
-  // WebSocket connection - SIMPLE VERSION
+  // WebSocket connection
   useEffect(() => {
     let ws: WebSocket | null = null
 
@@ -82,10 +83,18 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
             // Process PVC detection OUTSIDE the setState
             newSamples.forEach((amplitude, i) => {
-              const timestamp = Date.now() - (newSamples.length - i) * (1000 / 130)
+              // USE ECG TIMESTAMP FORMAT (not Date.now())
+              const timestamp = newTimes[newTimes.length - newSamples.length + i] * 1000 // Convert to milliseconds to match detector
               const result = pvcDetectorRef.current.processECGSample(amplitude, timestamp)
               if (result.heartRate > 0) setHeartRate(result.heartRate)
               setPvcCount(result.pvcCount)
+              setPvcEvents(result.pvcEvents) // Update PVC events
+              
+              // DEBUG: Log when PVC detected
+              if (result.pvcEvents.length > 0) {
+                console.log('🚨 PVC DETECTED! Events:', result.pvcEvents)
+                console.log('PVC Count:', result.pvcCount)
+              }
             })
             
             // Update time data and handle auto-scroll
@@ -130,7 +139,6 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
     connectWebSocket()
 
-    // Cleanup function
     return () => {
       if (ws) {
         ws.close()
@@ -147,8 +155,9 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
   const handleConnect = () => {
     setConnectionStatus('connecting')
-    pvcDetectorRef.current.reset() // Reset PVC counter
+    pvcDetectorRef.current.reset()
     setPvcCount(0)
+    setPvcEvents([])
     sendCommand('connect')
   }
 
@@ -174,6 +183,56 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   }
 
   const visibleData = getVisibleData()
+
+  // Get visible PVC events
+  const getVisiblePvcEvents = () => {
+    const viewEnd = currentViewStart + timeWindow
+    console.log('All PVC events:', pvcEvents)
+    console.log('Current view:', currentViewStart, 'to', viewEnd)
+    
+    return pvcEvents.filter(event => {
+      // PVC timestamp is now in milliseconds, convert to seconds
+      const eventTimeSeconds = event.timestamp / 1000
+      
+      console.log('Event timestamp:', event.timestamp, 'as seconds:', eventTimeSeconds)
+      
+      return eventTimeSeconds >= currentViewStart && eventTimeSeconds <= viewEnd
+    })
+  }
+
+  // Calculate PVC overlay positions
+  const getPvcOverlayStyle = (event: PVCEvent) => {
+    if (!chartContainerRef.current || visibleData.times.length === 0) return { display: 'none' }
+    
+    // Convert timestamp to seconds to match chart timeline
+    const eventTime = event.timestamp / 1000
+    
+    console.log('Overlay for event at:', eventTime, 'view start:', currentViewStart)
+    
+    const chartWidth = chartContainerRef.current.offsetWidth - 32
+    const timeRange = timeWindow
+    const relativeTime = eventTime - currentViewStart
+    const xPercent = (relativeTime / timeRange) * 100
+    
+    console.log('Calculated position:', xPercent, '%')
+    
+    // 400ms window (±200ms)
+    const windowWidth = (0.4 / timeRange) * 100
+    
+    return {
+      position: 'absolute' as const,
+      left: `${Math.max(0, xPercent - windowWidth / 2)}%`,
+      width: `${Math.min(windowWidth, 100 - Math.max(0, xPercent - windowWidth / 2))}%`,
+      top: '16px',
+      height: '20px',
+      backgroundColor: 'rgba(239, 68, 68, 0.6)', // Brighter red for testing
+      borderRadius: '2px',
+      pointerEvents: 'auto' as const,
+      zIndex: 10,
+      cursor: 'pointer',
+      border: '1px solid red' // Debug border
+    }
+  }
 
   // Navigation functions
   const scrollLeft = () => {
@@ -275,6 +334,8 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   const canScrollLeft = currentViewStart > 0
   const canScrollRight = allTimeData.length > 0 && currentViewStart < allTimeData[allTimeData.length - 1] - timeWindow
 
+  const visiblePvcEvents = getVisiblePvcEvents()
+
   return (
     <div className="w-full">
       {/* Status Bar */}
@@ -359,11 +420,26 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
         </div>
       </div>
 
-      {/* ECG Chart */}
-      <div className="bg-black rounded-lg border border-gray-700 p-4 mb-4">
+      {/* ECG Chart with PVC Overlay */}
+      <div className="bg-black rounded-lg border border-gray-700 p-4 mb-4 relative" ref={chartContainerRef}>
         <div style={{ height: '400px' }}>
           <Line ref={chartRef} data={chartData} options={chartOptions} />
         </div>
+        
+        {/* PVC Overlay Bands */}
+        {(() => {
+          console.log('🔴 Rendering overlays. Visible PVC events:', visiblePvcEvents.length, visiblePvcEvents)
+          return visiblePvcEvents.map((event, index) => {
+            console.log('Rendering overlay for event:', event, 'style:', getPvcOverlayStyle(event))
+            return (
+              <div
+                key={`${event.timestamp}-${index}`}
+                style={getPvcOverlayStyle(event)}
+                title={`PVC: ${event.currentRR}ms (${event.percentagePremature}% shorter than expected ${event.expectedRR}ms) at ${new Date(event.timestamp).toLocaleTimeString()}`}
+              />
+            )
+          })
+        })()}
       </div>
 
       {/* Controls */}
