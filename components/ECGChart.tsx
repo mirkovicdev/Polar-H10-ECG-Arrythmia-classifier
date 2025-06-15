@@ -13,6 +13,8 @@ import {
   ChartOptions,
 } from 'chart.js'
 import { Line } from 'react-chartjs-2'
+import { ImprovedPVCDetector } from '@/utils/PVCDetector'
+
 
 // Register Chart.js components
 ChartJS.register(
@@ -49,47 +51,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   const [pvcCount, setPvcCount] = useState(0)
   const [sampleCount, setSampleCount] = useState(0)
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
-
-  // Simple heart rate estimation
-  const estimateHeartRate = (ecgData: number[]): number => {
-    if (ecgData.length < 300) return 0
-    
-    try {
-      const data = ecgData.slice(-650) // Last 5 seconds
-      const mean = data.reduce((a, b) => a + b, 0) / data.length
-      const variance = data.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / data.length
-      const std = Math.sqrt(variance)
-      const threshold = mean + 1.2 * std
-      
-      const peaks: number[] = []
-      const minDistance = Math.floor(0.4 * 130) // 130 Hz sampling rate
-      
-      for (let i = minDistance; i < data.length - minDistance; i++) {
-        if (data[i] > data[i-1] && data[i] > data[i+1] && data[i] > threshold) {
-          if (peaks.length === 0 || (i - peaks[peaks.length - 1] >= minDistance)) {
-            peaks.push(i)
-          }
-        }
-      }
-      
-      if (peaks.length >= 3) {
-        const intervals: number[] = []
-        for (let i = 1; i < peaks.length; i++) {
-          intervals.push((peaks[i] - peaks[i-1]) / 130)
-        }
-        
-        const sortedIntervals = [...intervals].sort((a, b) => a - b)
-        const medianInterval = sortedIntervals[Math.floor(sortedIntervals.length / 2)]
-        const hr = 60.0 / medianInterval
-        
-        return (hr >= 40 && hr <= 180) ? hr : 0
-      }
-      
-      return 0
-    } catch {
-      return 0
-    }
-  }
+  const pvcDetectorRef = useRef(new ImprovedPVCDetector(130))
 
   // WebSocket connection - SIMPLE VERSION
   useEffect(() => {
@@ -117,6 +79,14 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
               const updatedData = [...prev, ...newSamples]
               return updatedData.length > maxSamples ? updatedData.slice(-maxSamples) : updatedData
             })
+
+            // Process PVC detection OUTSIDE the setState
+            newSamples.forEach((amplitude, i) => {
+              const timestamp = Date.now() - (newSamples.length - i) * (1000 / 130)
+              const result = pvcDetectorRef.current.processECGSample(amplitude, timestamp)
+              if (result.heartRate > 0) setHeartRate(result.heartRate)
+              setPvcCount(result.pvcCount)
+            })
             
             // Update time data and handle auto-scroll
             setAllTimeData(prev => {
@@ -133,12 +103,6 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
             })
             
             setSampleCount(prev => prev + newSamples.length)
-            
-            // Estimate heart rate
-            if (allEcgData.length > 500) {
-              const hr = estimateHeartRate([...allEcgData, ...newSamples])
-              if (hr > 0) setHeartRate(hr)
-            }
             
           } else if (data.type === 'status') {
             const connected = data.connected as boolean
@@ -183,6 +147,8 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
   const handleConnect = () => {
     setConnectionStatus('connecting')
+    pvcDetectorRef.current.reset() // Reset PVC counter
+    setPvcCount(0)
     sendCommand('connect')
   }
 
