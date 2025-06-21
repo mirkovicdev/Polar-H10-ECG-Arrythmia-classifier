@@ -49,16 +49,22 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   const [mmPerMv, setMmPerMv] = useState(10)
   const [timeWindow, setTimeWindow] = useState(10)
   
-  // Statistics
+  // Statistics - FIXED to use actual detected beats
   const [heartRate, setHeartRate] = useState(0)
   const [pvcCount, setPvcCount] = useState(0)
   const [pvcEvents, setPvcEvents] = useState<PVCEvent[]>([])
+  const [detectedBeats, setDetectedBeats] = useState(0) // NEW: actual detected beats
   const [sampleCount, setSampleCount] = useState(0)
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
-  const [burdenStats, setBurdenStats] = useState({ burden: 0, burdenCategory: 'low' })
+  const [burdenStats, setBurdenStats] = useState({ 
+    burden: 0, 
+    burdenCategory: 'low', 
+    confidence: 0,
+    timeWindow: 0,
+    totalBeats: 0
+  })
+  const [signalQuality, setSignalQuality] = useState(0)
   const pvcDetectorRef = useRef(new ImprovedPVCDetector(130))
-  const [prevPvcCount, setPrevPvcCount] = useState(0)
-
 
   // WebSocket connection
   useEffect(() => {
@@ -82,36 +88,32 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
             
             // Update ECG data
             setAllEcgData(prev => {
-              const maxSamples = 130 * 300
+              const maxSamples = 130 * 300 // 5 minutes at 130Hz
               const updatedData = [...prev, ...newSamples]
               return updatedData.length > maxSamples ? updatedData.slice(-maxSamples) : updatedData
             })
 
             // Process PVC detection OUTSIDE the setState
             newSamples.forEach((amplitude, i) => {
-              // USE ECG TIMESTAMP FORMAT (not Date.now())
-              const timestamp = newTimes[newTimes.length - newSamples.length + i] * 1000 // Convert to milliseconds to match detector
+              const timestamp = newTimes[newTimes.length - newSamples.length + i] * 1000 // Convert to milliseconds
               const result = pvcDetectorRef.current.processECGSample(amplitude, timestamp)
+              
+              // Update state with detection results
               if (result.heartRate > 0) setHeartRate(result.heartRate)
               setPvcCount(result.pvcCount)
-              setPvcEvents(result.pvcEvents) // Update PVC events
-              if (result.pvcCount !== prevPvcCount) {
-                setBurdenStats(BurdenCalculator.calculateBurden(result.totalBeats, result.pvcCount))
-                setPrevPvcCount(result.pvcCount)
-                console.log('🔍 Burden Calculation:', {
-                  expectedBeats: result.totalBeats,
-                  detectedBeats: result.detectedBeats,
-                  pvcCount: result.pvcCount,
-                  timeSpanSeconds: result.timeSpanMs / 1000,
-                  heartRate: result.heartRate,
-                  burden: ((result.pvcCount / result.totalBeats) * 100).toFixed(1) + '%'
-                })
-              }
+              setPvcEvents(result.pvcEvents)
+              setDetectedBeats(result.detectedBeats) // NEW: track actual detected beats
+              setSignalQuality(result.signalQuality)
               
-              // DEBUG: Log when PVC detected
-              if (result.pvcEvents.length > 0) {
-                console.log('🚨 PVC DETECTED! Events:', result.pvcEvents)
-                console.log('PVC Count:', result.pvcCount)
+              // Calculate burden using ACTUAL detected beats (not calculated expected beats)
+              if (result.detectedBeats > 10) { // Only calculate burden with sufficient data
+                const newBurdenStats = BurdenCalculator.calculateBurden(
+                  result.detectedBeats, // Use actual detected beats
+                  result.pvcCount,
+                  result.timeSpanMs,
+                  result.heartRate
+                )
+                setBurdenStats(newBurdenStats)
               }
             })
             
@@ -176,7 +178,14 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
     pvcDetectorRef.current.reset()
     setPvcCount(0)
     setPvcEvents([])
-    setPrevPvcCount(0)
+    setDetectedBeats(0)
+    setBurdenStats({
+      burden: 0,
+      burdenCategory: 'low',
+      confidence: 0,
+      timeWindow: 0,
+      totalBeats: 0
+    })
     sendCommand('connect')
   }
 
@@ -206,37 +215,34 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   // Get visible PVC events
   const getVisiblePvcEvents = () => {
     const viewEnd = currentViewStart + timeWindow
-    console.log('All PVC events:', pvcEvents)
-    console.log('Current view:', currentViewStart, 'to', viewEnd)
     
     return pvcEvents.filter(event => {
-      // PVC timestamp is now in milliseconds, convert to seconds
       const eventTimeSeconds = event.timestamp / 1000
-      
-      console.log('Event timestamp:', event.timestamp, 'as seconds:', eventTimeSeconds)
-      
       return eventTimeSeconds >= currentViewStart && eventTimeSeconds <= viewEnd
     })
   }
 
-  // Calculate PVC overlay positions
+  // Calculate PVC overlay positions with confidence-based styling
   const getPvcOverlayStyle = (event: PVCEvent) => {
     if (!chartContainerRef.current || visibleData.times.length === 0) return { display: 'none' }
     
-    // Convert timestamp to seconds to match chart timeline
     const eventTime = event.timestamp / 1000
-    
-    console.log('Overlay for event at:', eventTime, 'view start:', currentViewStart)
-    
     const chartWidth = chartContainerRef.current.offsetWidth - 32
     const timeRange = timeWindow
     const relativeTime = eventTime - currentViewStart
     const xPercent = (relativeTime / timeRange) * 100
     
-    console.log('Calculated position:', xPercent, '%')
+    // Adjust window width based on QRS width
+    const qrsWidthSeconds = event.qrsWidth / 1000
+    const windowWidth = Math.max(0.2, (qrsWidthSeconds / timeRange) * 100)
     
-    // 400ms window (±200ms)
-    const windowWidth = (0.4 / timeRange) * 100
+    // Color intensity based on confidence
+    const alpha = Math.max(0.3, Math.min(0.8, event.confidence))
+    
+    // Simple color coding
+    const backgroundColor = `rgba(239, 68, 68, ${alpha})` // Red for all PVCs
+    const borderColor = event.confidence > 0.8 ? '#ef4444' : 
+                       event.confidence > 0.6 ? '#f97316' : '#eab308'
     
     return {
       position: 'absolute' as const,
@@ -244,12 +250,12 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
       width: `${Math.min(windowWidth, 100 - Math.max(0, xPercent - windowWidth / 2))}%`,
       top: '16px',
       height: '20px',
-      backgroundColor: 'rgba(239, 68, 68, 0.6)', // Brighter red for testing
+      backgroundColor,
       borderRadius: '2px',
       pointerEvents: 'auto' as const,
       zIndex: 10,
       cursor: 'pointer',
-      border: '1px solid red' // Debug border
+      border: `1px solid ${borderColor}`
     }
   }
 
@@ -357,7 +363,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
   return (
     <div className="w-full">
-      {/* Status Bar */}
+      {/* Status Bar - ENHANCED */}
       <div className="bg-gray-900 rounded-lg p-4 mb-4">
         <div className="flex flex-wrap justify-between items-center text-sm">
           <div className="flex items-center space-x-4">
@@ -372,11 +378,16 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
             </span>
             <span>❤️ {heartRate > 0 ? heartRate.toFixed(0) : '--'} BPM</span>
             <span>⚡ PVCs: {pvcCount}</span>
+            <span>🫀 Beats: {detectedBeats}</span>
             <span className={BurdenCalculator.getBurdenColor(burdenStats.burdenCategory as 'low' | 'moderate' | 'high')}>
-              📊 {BurdenCalculator.formatBurden(burdenStats.burden)} burden
+              📊 {BurdenCalculator.formatBurden(burdenStats.burden, burdenStats.confidence)} burden
+            </span>
+            <span className={BurdenCalculator.getConfidenceColor(burdenStats.confidence)}>
+              📈 Confidence: {(burdenStats.confidence * 100).toFixed(0)}%
             </span>
           </div>
           <div className="flex items-center space-x-4">
+            <span>📡 Signal: {(signalQuality * 100).toFixed(0)}%</span>
             <span>Samples: {sampleCount.toLocaleString()}</span>
             <span>{mmPerSecond}mm/s</span>
             <span>{mmPerMv}mm/mV</span>
@@ -442,29 +453,23 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
         </div>
       </div>
 
-      {/* ECG Chart with PVC Overlay */}
+      {/* ECG Chart with Enhanced PVC Overlay */}
       <div className="bg-black rounded-lg border border-gray-700 p-4 mb-4 relative" ref={chartContainerRef}>
         <div style={{ height: '400px' }}>
           <Line ref={chartRef} data={chartData} options={chartOptions} />
         </div>
         
-        {/* PVC Overlay Bands */}
-        {(() => {
-          console.log('🔴 Rendering overlays. Visible PVC events:', visiblePvcEvents.length, visiblePvcEvents)
-          return visiblePvcEvents.map((event, index) => {
-            console.log('Rendering overlay for event:', event, 'style:', getPvcOverlayStyle(event))
-            return (
-              <div
-                key={`${event.timestamp}-${index}`}
-                style={getPvcOverlayStyle(event)}
-                title={`PVC: ${event.currentRR}ms (${event.percentagePremature}% shorter than expected ${event.expectedRR}ms) at ${new Date(event.timestamp).toLocaleTimeString()}`}
-              />
-            )
-          })
-        })()}
+        {/* Enhanced PVC Overlay with Confidence-based Styling */}
+        {visiblePvcEvents.map((event, index) => (
+          <div
+            key={`pvc-${event.timestamp}-${index}`}
+            style={getPvcOverlayStyle(event)}
+            title={`PVC (${event.detectionPathway}): ${event.currentRR}ms (${event.percentagePremature}% premature), QRS: ${event.qrsWidth.toFixed(1)}ms, Amplitude: ${event.amplitude.toFixed(0)}μV, Confidence: ${(event.confidence * 100).toFixed(0)}%, Morphology: ${(event.morphologyScore * 100).toFixed(0)}% at ${new Date(event.timestamp).toLocaleTimeString()}`}
+          />
+        ))}
       </div>
 
-      {/* Controls */}
+      {/* Enhanced Controls */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         {/* Time Scale Control */}
         <div className="bg-gray-900 rounded-lg p-4">
@@ -517,6 +522,33 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
           </div>
         </div>
       </div>
+
+      {/* New: Clinical Summary Panel */}
+      {detectedBeats > 50 && (
+        <div className="bg-gray-900 rounded-lg p-4 mt-4">
+          <h3 className="text-lg font-semibold mb-3">📋 Clinical Summary</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+            <div>
+              <span className="text-gray-400">Recording Duration:</span>
+              <div className="font-medium">{burdenStats.timeWindow.toFixed(1)} minutes</div>
+            </div>
+            <div>
+              <span className="text-gray-400">Detection Quality:</span>
+              <div className={`font-medium ${BurdenCalculator.getConfidenceColor(burdenStats.confidence)}`}>
+                {burdenStats.confidence >= 0.8 ? 'High' : 
+                 burdenStats.confidence >= 0.6 ? 'Good' : 
+                 burdenStats.confidence >= 0.4 ? 'Fair' : 'Poor'}
+              </div>
+            </div>
+            <div>
+              <span className="text-gray-400">Clinical Assessment:</span>
+              <div className={`font-medium ${BurdenCalculator.getBurdenColor(burdenStats.burdenCategory as 'low' | 'moderate' | 'high')}`}>
+                {BurdenCalculator.getClinicalInterpretation(burdenStats.burden, burdenStats.confidence)}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

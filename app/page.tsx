@@ -53,7 +53,7 @@ export default function Home() {
             </div>
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="text-3xl mb-3">⚡</div>
-              <h4 className="font-semibold mb-2">PVC Detection</h4>
+              <h4 className="font-semibold mb-2">Statistical PVC Detection</h4>
               <p className="text-sm text-gray-400">Real-time detection and counting of arrhythmias using TypeScript analysis</p>
             </div>
             <div className="bg-gray-800 rounded-lg p-4">
