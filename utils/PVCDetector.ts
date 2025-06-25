@@ -1,5 +1,7 @@
 // utils/PVCDetector.ts - Simple Fix for Multifocal PVCs (No Overcomplications)
 
+import { MorphologyTrainer, type TrainingResult } from './MorphologyTrainer'
+
 export interface PVCEvent {
   timestamp: number;
   currentRR: number;
@@ -8,8 +10,9 @@ export interface PVCEvent {
   qrsWidth: number;
   confidence: number;
   morphologyScore: number;
-  detectionPathway: 'high-amplitude' | 'wide-qrs' | 'premature-morph';
+  detectionPathway: 'high-amplitude' | 'wide-qrs' | 'premature-morph' | 'gap-detected' | 'morphology-only';
   amplitude: number;
+  isInferred?: boolean; // NEW: Mark inferred PVCs
 }
 
 export interface PVCDetectionResult {
@@ -33,11 +36,97 @@ export class ImprovedPVCDetector {
   private rrHistory: number[] = []
   private pvcCount = 0
   private pvcEvents: PVCEvent[] = []
+  private inferredPvcEvents: PVCEvent[] = [] // NEW: Track inferred PVCs separately
   private startTime: number = 0
   private totalDetectedBeats = 0
 
+  // ADD: Smart training with morphology clustering
+  private morphologyTrainer = new MorphologyTrainer()
+  public isLearningMode = true // Make public for ECG chart access
+  public learningBeatCount = 0 // Make public for ECG chart access
+  public maxLearningBeats = 40 // Make public for ECG chart access
+  private learningBeats: { data: number[], index: number, amplitude: number, qrsWidth: number }[] = []
+  public trainingResult: TrainingResult | null = null // Make public for debug access
+
   constructor(private samplingRate: number = 130) {
     this.startTime = Date.now()
+  }
+
+  // ADD: Method to check training status for ECG chart
+  public getTrainingStatus() {
+    return {
+      isLearning: this.isLearningMode,
+      progress: this.learningBeatCount,
+      total: this.maxLearningBeats,
+      trainingResult: this.trainingResult
+    }
+  }
+
+  // NEW: Parallel Gap-Based PVC Detection System
+  private detectGapBasedPVCs() {
+    if (this.rPeaks.length < 6) return
+    
+    // Only run gap detection occasionally to avoid spam
+    if (this.rPeaks.length % 5 !== 0) return
+    
+    // Calculate expected RR interval from recent normal beats
+    const recentRRs = this.rrHistory.slice(-10)
+    const normalRRs = recentRRs.filter(rr => rr > 500 && rr < 1200) // Stricter filtering
+    if (normalRRs.length < 5) return
+    
+    const sortedNormalRRs = [...normalRRs].sort((a, b) => a - b)
+    const medianNormalRR = sortedNormalRRs[Math.floor(sortedNormalRRs.length / 2)]
+    
+    // Only check the most recent RR interval
+    const lastIndex = this.rPeaks.length - 1
+    if (lastIndex < 1) return
+    
+    const currentRR = this.rPeaks[lastIndex] - this.rPeaks[lastIndex - 1]
+    const prevBeatTime = this.rPeaks[lastIndex - 1]
+    const nextBeatTime = this.rPeaks[lastIndex]
+    
+    // Much more conservative gap detection
+    const isVeryLongGap = currentRR > medianNormalRR * 1.8 // 80% longer (very conservative)
+    
+    if (isVeryLongGap) {
+      // Check if both surrounding beats are normal
+      const prevBeatIsPVC = this.pvcEvents.some(pvc => Math.abs(pvc.timestamp - prevBeatTime) < 200)
+      const nextBeatIsPVC = this.pvcEvents.some(pvc => Math.abs(pvc.timestamp - nextBeatTime) < 200)
+      
+      // Check if we already inferred a PVC in this gap
+      const alreadyInferred = this.inferredPvcEvents.some(pvc => 
+        pvc.timestamp > prevBeatTime && pvc.timestamp < nextBeatTime
+      )
+      
+      if (!prevBeatIsPVC && !nextBeatIsPVC && !alreadyInferred) {
+        // Only infer 1 PVC for very obvious gaps
+        const estimatedTimestamp = prevBeatTime + (currentRR / 2)
+        
+        const inferredPVC: PVCEvent = {
+          timestamp: estimatedTimestamp,
+          currentRR: currentRR / 2,
+          expectedRR: medianNormalRR,
+          percentagePremature: 0,
+          qrsWidth: 0,
+          confidence: 0.5, // Lower confidence
+          morphologyScore: 0,
+          detectionPathway: 'gap-detected',
+          amplitude: 0,
+          isInferred: true
+        }
+        
+        this.inferredPvcEvents.push(inferredPVC)
+        this.pvcCount++
+        
+        console.log('🔍 GAP-DETECTED PVC 🔍')
+        console.log(`GAP: ${currentRR}ms (expected: ${medianNormalRR}ms)`)
+        console.log('─'.repeat(60))
+      }
+    }
+    
+    // Clean old inferred events
+    const cutoffTime = Date.now() - 120000
+    this.inferredPvcEvents = this.inferredPvcEvents.filter(e => e.timestamp >= cutoffTime)
   }
 
   processECGSample(amplitude: number, timestamp: number): PVCDetectionResult {
@@ -111,6 +200,11 @@ export class ImprovedPVCDetector {
     for (const peak of newPeaks) {
       this.processPeak(peak, data)
     }
+    
+    // NEW: Run parallel gap-based detection after beat processing
+    if (this.rPeaks.length > 5) {
+      this.detectGapBasedPVCs()
+    }
   }
 
   private isValidPeak(data: number[], index: number, direction: 'positive' | 'negative'): boolean {
@@ -144,11 +238,24 @@ export class ImprovedPVCDetector {
     const cutoffTime = peak.time - 120000
     this.cleanOldData(cutoffTime)
 
+    // ADD: Handle learning mode
+    if (this.isLearningMode) {
+      this.handleLearningMode(peak, data, qrsWidth)
+      return // Don't run PVC detection during learning
+    }
+
     if (this.rPeaks.length < 8) return
 
-    this.updateRRHistory()
+    // FIXED: Add current RR to history BEFORE analysis
+    if (this.rPeaks.length >= 2) {
+      const currentRR = this.rPeaks[this.rPeaks.length - 1] - this.rPeaks[this.rPeaks.length - 2]
+      this.rrHistory.push(currentRR)
+    }
 
     const analysis = this.analyzeBeat(peak, data, qrsWidth)
+    
+    // FIXED: Update RR history AFTER analysis to avoid contamination
+    this.updateRRHistory()
     
     if (analysis.isPVC) {
       this.pvcCount++
@@ -161,7 +268,8 @@ export class ImprovedPVCDetector {
         confidence: analysis.confidence,
         morphologyScore: analysis.morphologyScore,
         detectionPathway: analysis.pathway,
-        amplitude: peak.amplitude
+        amplitude: peak.amplitude,
+        isInferred: false // Direct detection
       })
 
       console.log('🚨 PVC DETECTED 🚨')
@@ -171,23 +279,134 @@ export class ImprovedPVCDetector {
       console.log(`CONFIDENCE: ${analysis.confidence.toFixed(2)}`)
       console.log('─'.repeat(60))
     } else {
-      // Store as normal template only if it's clearly normal
-      if (analysis.confidence < 0.3) { // Only store very normal beats
-        this.storeNormalTemplate(data, peak.index)
+      // FIXED: Store as normal template only if it's VERY clearly normal (prevent contamination)
+      if (this.rrHistory.length > 0) {
+        const currentRR = this.rrHistory[this.rrHistory.length - 1]
+        const recentRRs = this.rrHistory.slice(-10)
+        const avgRR = recentRRs.reduce((a, b) => a + b, 0) / recentRRs.length
+        const isPremature = currentRR < avgRR * 0.85
+        
+        if (analysis.confidence < 0.1 && !isPremature && peak.amplitude < 500 && qrsWidth < 90) {
+          this.storeNormalTemplate(data, peak.index)
+        }
       }
     }
   }
 
+  // ADD: Smart learning mode handler
+  private handleLearningMode(peak: { time: number; index: number; amplitude: number }, data: number[], qrsWidth: number) {
+    this.learningBeatCount++
+    
+    // Store this beat for analysis (now includes QRS width)
+    this.learningBeats.push({
+      data: [...data], // Copy the data
+      index: peak.index,
+      amplitude: peak.amplitude,
+      qrsWidth: qrsWidth
+    })
+
+    console.log(`🎓 SMART LEARNING: Beat ${this.learningBeatCount}/${this.maxLearningBeats}`)
+    
+    // Check if we've collected enough learning beats
+    if (this.learningBeatCount >= this.maxLearningBeats) {
+      this.finalizeLearning()
+    }
+  }
+
+  // ADD: Use smart morphology trainer
+  private finalizeLearning() {
+    console.log('🎓 SMART LEARNING COMPLETE - Finding dominant morphology...')
+    
+    // Use the smart trainer to find dominant morphology
+    this.trainingResult = this.morphologyTrainer.trainFromBeats(this.learningBeats, this.samplingRate)
+    
+    if (this.trainingResult.confidence < 0.5) {
+      console.log('🚨 WARNING: Low training confidence - using template-free detection')
+      this.normalTemplates = [] // Force template-free detection
+    } else {
+      // Use the smart templates
+      this.normalTemplates = this.trainingResult.normalTemplates
+      console.log(`🎓 SMART TRAINING SUCCESS:`)
+      console.log(`  📊 Clusters found: ${this.trainingResult.clustersFound}`)
+      console.log(`  🎯 Normal cluster size: ${this.trainingResult.normalClusterSize}`)
+      console.log(`  💪 Confidence: ${(this.trainingResult.confidence * 100).toFixed(1)}%`)
+    }
+
+    // Update RR history from learning beats
+    this.updateRRHistoryFromLearning()
+
+    // Exit learning mode
+    this.isLearningMode = false
+    this.learningBeats = [] // Clear memory
+
+    // FIXED: Reset start time so detection starts from 0 seconds
+    this.startTime = Date.now()
+
+    console.log('🎓 SMART LEARNING MODE COMPLETE - PVC detection enabled')
+    console.log(`🎓 RR History after training: ${this.rrHistory.slice(-10)} (length: ${this.rrHistory.length})`)
+  }
+
+  // ADD: Update RR history from learning period
+  private updateRRHistoryFromLearning() {
+    if (this.rPeaks.length < 2) return
+    
+    const learningRRs: number[] = []
+    for (let i = 1; i < Math.min(this.rPeaks.length, this.learningBeatCount + 1); i++) {
+      learningRRs.push(this.rPeaks[i] - this.rPeaks[i - 1])
+    }
+    
+    this.rrHistory = learningRRs
+    console.log(`🎓 Initialized RR history with ${learningRRs.length} intervals`)
+  }
+
   private analyzeBeat(peak: { time: number; index: number; amplitude: number }, data: number[], qrsWidth: number) {
+    // FIXED: Check if rrHistory is empty before accessing
+    if (this.rrHistory.length === 0) {
+      return {
+        isPVC: false,
+        currentRR: 0,
+        expectedRR: 0,
+        percentagePremature: 0,
+        confidence: 0,
+        morphologyScore: 0,
+        pathway: 'high-amplitude' as PVCEvent['detectionPathway']
+      }
+    }
+
     const currentRR = this.rrHistory[this.rrHistory.length - 1]
+    const nextRR = this.rrHistory.length > 1 ? this.rrHistory[this.rrHistory.length - 2] : currentRR
     
-    // Use more robust statistics
+    // FIXED: Use more robust statistics with filtering
     const recentRRs = this.rrHistory.slice(-20)
-    const sortedRRs = [...recentRRs].sort((a, b) => a - b)
-    const medianRR = sortedRRs[Math.floor(sortedRRs.length / 2)]
-    const expectedRR = medianRR
+    const normalRRs = recentRRs.filter(rr => rr > 500 && rr < 1200)
+    let expectedRR: number
+    if (normalRRs.length === 0) {
+      expectedRR = 800 // Default
+    } else {
+      const sortedRRs = [...normalRRs].sort((a, b) => a - b)
+      expectedRR = sortedRRs[Math.floor(sortedRRs.length / 2)]
+    }
     
-    // **SIMPLIFIED 3-PATHWAY DETECTION**
+    console.log(`🔍 RR DEBUG - Current: ${currentRR}ms, Expected: ${expectedRR}ms, History length: ${this.rrHistory.length}`)
+    
+    // FIXED morphology scoring - only dissimilarity from normal
+    const morphologyScore = this.calculateSimpleMorphology(data, peak.index)
+    console.log(`🔬 MORPH DEBUG - Score: ${morphologyScore.toFixed(3)}, Amplitude: ${peak.amplitude}, QRS: ${qrsWidth}`)
+    
+    // **SIMPLE FIX: Morphology-only detection for obvious PVCs**
+    if (morphologyScore > 0.7) {
+      return {
+        isPVC: true,
+        currentRR,
+        expectedRR,
+        percentagePremature: Math.round((1 - currentRR / expectedRR) * 100),
+        confidence: Math.min(0.9, morphologyScore),
+        morphologyScore,
+        pathway: 'morphology-only' as PVCEvent['detectionPathway']
+      }
+    }
+    
+    // **SIMPLIFIED 4-PATHWAY DETECTION**
     
     // Pathway 1: High-amplitude PVCs (your original working method)
     const isHighAmplitude = peak.amplitude > 600
@@ -196,13 +415,22 @@ export class ImprovedPVCDetector {
     // Pathway 2: Wide QRS
     const isWide = qrsWidth > 120 // Keep standard threshold
     
-    // Pathway 3: Premature + Morphology (FIXED for multifocal)
-    const isPremature = currentRR < expectedRR * 0.75 // Conservative threshold
-    const isVeryPremature = currentRR < expectedRR * 0.65
+    // FIXED: More sensitive premature detection for bigeminy
+    const isPremature = currentRR < expectedRR * 0.80        // Changed from 0.90 to 0.80
+    const isVeryPremature = currentRR < expectedRR * 0.70    // Changed from 0.80 to 0.70  
+    const isModeratelyPremature = currentRR < expectedRR * 0.85 // Changed from 0.95 to 0.85
     
-    // FIXED morphology scoring - only dissimilarity from normal
-    const morphologyScore = this.calculateSimpleMorphology(data, peak.index)
-    const hasAbnormalMorphology = morphologyScore > 0.4 // Conservative threshold
+    // Pathway 4: Compensatory Pause Detection (NEW - for missed PVCs)
+    const hasCompensatoryPause = nextRR > expectedRR * 1.25 // 25% longer than expected
+    
+    // FIXED: Lower morphology thresholds for similar PVCs
+    const hasAbnormalMorphology = morphologyScore > 0.12 // Changed from 0.25 to 0.12
+    const hasModerateAbnormalMorphology = morphologyScore > 0.08 // Changed from 0.15 to 0.08
+    
+    if (morphologyScore > 0.5) {
+        console.log(`🚨 HIGH MORPH SCORE: ${morphologyScore.toFixed(3)} - QRS: ${qrsWidth}ms, AMP: ${peak.amplitude}μV`)
+        console.log(`🚨 Premature tests: isPremature=${isPremature}, isVeryPremature=${isVeryPremature}`)
+    }
     
     // SIMPLE DECISION LOGIC (no overcomplications)
     let pathway: PVCEvent['detectionPathway'] = 'high-amplitude'
@@ -228,6 +456,18 @@ export class ImprovedPVCDetector {
       isPVC = true
       pathway = 'premature-morph'
       confidence = 0.7
+    }
+    
+    // Pathway 4: Compensatory Pause Detection (NEW - catches missed PVCs)
+    else if (hasCompensatoryPause && isModeratelyPremature) {
+      isPVC = true
+      pathway = 'premature-morph'
+      confidence = 0.6
+      
+      // Boost confidence if also has abnormal morphology
+      if (hasModerateAbnormalMorphology) {
+        confidence = 0.75
+      }
     }
     
     const percentagePremature = Math.round((1 - currentRR / expectedRR) * 100)
@@ -267,12 +507,13 @@ export class ImprovedPVCDetector {
   }
 
   private calculateQRSWidth(data: number[], peakIndex: number): number {
-    const searchWindow = Math.floor(this.samplingRate * 0.08) // 80ms window
+    const searchWindow = Math.floor(this.samplingRate * 0.1) // Increased from 0.08 to 0.1 (100ms)
     const start = Math.max(0, peakIndex - searchWindow)
     const end = Math.min(data.length, peakIndex + searchWindow)
     
     const baseline = this.calculateLocalBaseline(data, peakIndex)
-    const threshold = Math.abs(data[peakIndex] - baseline) * 0.1
+    const peakAmplitude = Math.abs(data[peakIndex] - baseline)
+    const threshold = peakAmplitude * 0.15 // Increased from 0.1 to 0.15 (more lenient)
     
     // Find onset
     let onset = peakIndex
@@ -309,18 +550,33 @@ export class ImprovedPVCDetector {
     return allValues.length > 0 ? allValues.reduce((a, b) => a + b, 0) / allValues.length : 0
   }
 
+  // FIXED: Only include normal-to-normal RR intervals
   private updateRRHistory() {
     if (this.rPeaks.length < 2) return
     
     const newRRs: number[] = []
     for (let i = 1; i < this.rPeaks.length; i++) {
-      newRRs.push(this.rPeaks[i] - this.rPeaks[i - 1])
+      const rrInterval = this.rPeaks[i] - this.rPeaks[i - 1]
+      const currentTime = this.rPeaks[i]
+      const prevTime = this.rPeaks[i - 1]
+      
+      // Check if either beat was a PVC
+      const currentBeatIsPVC = this.pvcEvents.some(pvc => 
+        Math.abs(pvc.timestamp - currentTime) < 100
+      )
+      const prevBeatIsPVC = this.pvcEvents.some(pvc => 
+        Math.abs(pvc.timestamp - prevTime) < 100
+      )
+      
+      // Only include normal-to-normal RR intervals
+      if (!currentBeatIsPVC && !prevBeatIsPVC && rrInterval > 400 && rrInterval < 1500) {
+        newRRs.push(rrInterval)
+      }
     }
     
-    this.rrHistory = newRRs
-    
-    if (this.rrHistory.length > 30) {
-      this.rrHistory = this.rrHistory.slice(-30)
+    // Keep some old normal RRs for stability
+    if (newRRs.length > 0) {
+      this.rrHistory = [...this.rrHistory.slice(-15), ...newRRs].slice(-30)
     }
   }
 
@@ -407,18 +663,31 @@ export class ImprovedPVCDetector {
     const currentTime = this.timeBuffer.length > 0 ? this.timeBuffer[this.timeBuffer.length - 1] : this.startTime
     const timeSpanMs = currentTime - this.startTime
 
+    // Combine direct and inferred PVC events for result
+    const allPvcEvents = [...this.pvcEvents, ...this.inferredPvcEvents]
+      .sort((a, b) => a.timestamp - b.timestamp) // Sort by timestamp
+
     return {
-      pvcCount: this.pvcCount,
-      totalBeats: this.totalDetectedBeats,
-      detectedBeats: this.rPeaks.length,
-      heartRate,
+      pvcCount: this.isLearningMode ? 0 : this.pvcCount, // FIXED: Don't count PVCs during training
+      totalBeats: this.isLearningMode ? 0 : this.totalDetectedBeats, // FIXED: Don't count beats during training
+      detectedBeats: this.isLearningMode ? 0 : this.totalDetectedBeats, // FIXED: Don't count beats during training
+      heartRate: this.isLearningMode ? 0 : heartRate, // FIXED: Don't show HR during training
       isPVC: false,
-      pvcEvents: [...this.pvcEvents],
+      pvcEvents: this.isLearningMode ? [] : allPvcEvents, // FIXED: Don't show PVCs during training
       timeSpanMs,
       signalQuality: this.calculateSignalQuality()
     }
   }
-
+  resetCounters(): void {
+    // Only reset detection counters, keep training data intact
+    this.pvcCount = 0
+    this.pvcEvents = []
+    this.inferredPvcEvents = []
+    this.totalDetectedBeats = 0
+    this.startTime = Date.now() // Reset timing for fresh burden calculation
+    
+    console.log('🔄 Detection counters reset - Training data preserved')
+  }
   reset(): void {
     this.ecgBuffer = []
     this.timeBuffer = []
@@ -429,7 +698,16 @@ export class ImprovedPVCDetector {
     this.rrHistory = []
     this.pvcCount = 0
     this.pvcEvents = []
+    this.inferredPvcEvents = [] // NEW: Reset inferred events
     this.startTime = 0
     this.totalDetectedBeats = 0
+    
+    // ADD: Reset smart learning mode
+    this.isLearningMode = true
+    this.learningBeatCount = 0
+    this.learningBeats = []
+    this.trainingResult = null
+    
+    console.log('🎓 PVC Detector reset - Learning mode enabled')
   }
 }

@@ -276,3 +276,42 @@ This project is licensed under the MIT License, promoting open-source collaborat
 [![Star History](https://img.shields.io/github/stars/mirkovicdev/Polar-H10-ECG-Arrythmia-classifier?style=social)]()
 [![Research Impact](https://img.shields.io/badge/Research-Impact-blue.svg)]()
 [![Medical Innovation](https://img.shields.io/badge/Medical-Innovation-green.svg)]()
+
+```
+ecg-webapp
+├─ app
+│  ├─ favicon.ico
+│  ├─ globals.css
+│  ├─ layout.tsx
+│  └─ page.tsx
+├─ components
+│  ├─ BurdenChart.tsx
+│  ├─ ECGChart.tsx
+│  └─ TrainingDebug.tsx
+├─ ecg_websocket_server.py
+├─ eslint.config.mjs
+├─ img1.png
+├─ img2.png
+├─ img3.png
+├─ LICENSE
+├─ next.config.ts
+├─ package-lock.json
+├─ package.json
+├─ postcss.config.mjs
+├─ public
+│  ├─ file.svg
+│  ├─ globe.svg
+│  ├─ next.svg
+│  ├─ vercel.svg
+│  └─ window.svg
+├─ README.md
+├─ requirements.txt
+├─ tsconfig.json
+└─ utils
+   ├─ beatHistory.ts
+   ├─ burden.ts
+   ├─ MorphologyTrainer.ts
+   ├─ PVCDetector.ts
+   └─ temporalBurden.ts
+
+```

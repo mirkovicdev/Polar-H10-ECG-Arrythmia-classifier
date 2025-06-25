@@ -2,7 +2,7 @@
 
 'use client'
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from 'react'
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -32,9 +32,14 @@ ChartJS.register(
 interface ECGChartProps {
   isConnected: boolean
   onConnectionChange: (connected: boolean) => void
+  onBeatDetected?: (timestamp: number, isPVC: boolean) => void
 }
 
-export default function ECGChart({ isConnected, onConnectionChange }: ECGChartProps) {
+export interface ECGChartRef {
+  pvcDetectorRef: React.RefObject<ImprovedPVCDetector>
+}
+
+const ECGChart = forwardRef<ECGChartRef, ECGChartProps>(({ isConnected, onConnectionChange, onBeatDetected }, ref) => {
   const chartRef = useRef<ChartJS<'line'>>(null)
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const websocketRef = useRef<WebSocket | null>(null)
@@ -49,11 +54,11 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
   const [mmPerMv, setMmPerMv] = useState(10)
   const [timeWindow, setTimeWindow] = useState(10)
   
-  // Statistics - FIXED to use actual detected beats
+  // Statistics
   const [heartRate, setHeartRate] = useState(0)
   const [pvcCount, setPvcCount] = useState(0)
   const [pvcEvents, setPvcEvents] = useState<PVCEvent[]>([])
-  const [detectedBeats, setDetectedBeats] = useState(0) // NEW: actual detected beats
+  const [detectedBeats, setDetectedBeats] = useState(0)
   const [sampleCount, setSampleCount] = useState(0)
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
   const [burdenStats, setBurdenStats] = useState({ 
@@ -64,7 +69,16 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
     totalBeats: 0
   })
   const [signalQuality, setSignalQuality] = useState(0)
+  
+  // ADDED: Training status
+  const [trainingStatus, setTrainingStatus] = useState({ isLearning: false, progress: 0, total: 40 })
+  const [trainingCompleted, setTrainingCompleted] = useState(false)
+  
   const pvcDetectorRef = useRef(new ImprovedPVCDetector(130))
+  useImperativeHandle(ref, () => ({
+    pvcDetectorRef
+  }))
+  const lastDetectedBeats = useRef(0)
 
   // WebSocket connection
   useEffect(() => {
@@ -93,43 +107,73 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
               return updatedData.length > maxSamples ? updatedData.slice(-maxSamples) : updatedData
             })
 
-            // Process PVC detection OUTSIDE the setState
+            // Process PVC detection
             newSamples.forEach((amplitude, i) => {
-              const timestamp = newTimes[newTimes.length - newSamples.length + i] * 1000 // Convert to milliseconds
+              const timestamp = newTimes[newTimes.length - newSamples.length + i] * 1000
               const result = pvcDetectorRef.current.processECGSample(amplitude, timestamp)
               
-              // Update state with detection results
-              if (result.heartRate > 0) setHeartRate(result.heartRate)
-              setPvcCount(result.pvcCount)
-              setPvcEvents(result.pvcEvents)
-              setDetectedBeats(result.detectedBeats) // NEW: track actual detected beats
-              setSignalQuality(result.signalQuality)
+              // ADDED: Check training status
+              const currentTrainingStatus = pvcDetectorRef.current.getTrainingStatus()
+              setTrainingStatus(currentTrainingStatus)
               
-              // Calculate burden using ACTUAL detected beats (not calculated expected beats)
-              if (result.detectedBeats > 10) { // Only calculate burden with sufficient data
-                const newBurdenStats = BurdenCalculator.calculateBurden(
-                  result.detectedBeats, // Use actual detected beats
-                  result.pvcCount,
-                  result.timeSpanMs,
-                  result.heartRate
-                )
-                setBurdenStats(newBurdenStats)
+              // If training just completed, reset time axis
+              if (!currentTrainingStatus.isLearning && trainingStatus.isLearning) {
+                setTrainingCompleted(true)
+                setCurrentViewStart(0) // Reset to start
+                setAutoScroll(true)
+                // Clear all previous data to start fresh
+                setAllEcgData([])
+                setAllTimeData([])
+                setPvcCount(0)
+                setPvcEvents([])
+                setDetectedBeats(0)
+                lastDetectedBeats.current = 0
+                pvcDetectorRef.current.resetCounters()
+              }
+              
+              // Only update stats if NOT in training mode
+              if (!currentTrainingStatus.isLearning) {
+                if (result.heartRate > 0) setHeartRate(result.heartRate)
+                setPvcCount(result.pvcCount)
+                setPvcEvents(result.pvcEvents)
+                setDetectedBeats(result.detectedBeats)
+                setSignalQuality(result.signalQuality)
+                
+                // Beat detection callback
+                if (result.detectedBeats > lastDetectedBeats.current && onBeatDetected) {
+                  const latestPVC = result.pvcEvents[result.pvcEvents.length - 1]
+                  const isPVC = latestPVC && Math.abs(latestPVC.timestamp - timestamp) < 500
+                  onBeatDetected(timestamp, isPVC || false)
+                  lastDetectedBeats.current = result.detectedBeats
+                }
+                
+                // Calculate burden
+                if (result.detectedBeats > 10) {
+                  const newBurdenStats = BurdenCalculator.calculateBurden(
+                    result.detectedBeats,
+                    result.pvcCount,
+                    result.timeSpanMs,
+                    result.heartRate
+                  )
+                  setBurdenStats(newBurdenStats)
+                }
               }
             })
             
-            // Update time data and handle auto-scroll
-            setAllTimeData(prev => {
-              const maxSamples = 130 * 300
-              const updatedTimes = [...prev, ...newTimes]
-              const finalTimes = updatedTimes.length > maxSamples ? updatedTimes.slice(-maxSamples) : updatedTimes
-              
-              // Auto-scroll if enabled
-              if (autoScroll && finalTimes.length > 0) {
-                setCurrentViewStart(Math.max(0, finalTimes[finalTimes.length - 1] - timeWindow))
-              }
-              
-              return finalTimes
-            })
+            // Update time data and handle auto-scroll (only if not in training or training just completed)
+            if (!trainingStatus.isLearning || trainingCompleted) {
+              setAllTimeData(prev => {
+                const maxSamples = 130 * 300
+                const updatedTimes = [...prev, ...newTimes]
+                const finalTimes = updatedTimes.length > maxSamples ? updatedTimes.slice(-maxSamples) : updatedTimes
+                
+                if (autoScroll && finalTimes.length > 0) {
+                  setCurrentViewStart(Math.max(0, finalTimes[finalTimes.length - 1] - timeWindow))
+                }
+                
+                return finalTimes
+              })
+            }
             
             setSampleCount(prev => prev + newSamples.length)
 
@@ -164,7 +208,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
         ws.close()
       }
     }
-  }, [autoScroll, timeWindow, onConnectionChange])
+  }, [autoScroll, timeWindow, onConnectionChange, trainingStatus.isLearning])
 
   // Send commands to Python server
   const sendCommand = (command: string) => {
@@ -179,6 +223,8 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
     setPvcCount(0)
     setPvcEvents([])
     setDetectedBeats(0)
+    lastDetectedBeats.current = 0
+    setTrainingCompleted(false)
     setBurdenStats({
       burden: 0,
       burdenCategory: 'low',
@@ -363,7 +409,7 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
 
   return (
     <div className="w-full">
-      {/* Status Bar - ENHANCED */}
+      {/* Status Bar */}
       <div className="bg-gray-900 rounded-lg p-4 mb-4">
         <div className="flex flex-wrap justify-between items-center text-sm">
           <div className="flex items-center space-x-4">
@@ -376,15 +422,23 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
               {connectionStatus === 'connected' ? 'Connected' : 
                connectionStatus === 'connecting' ? 'Connecting...' : 'Disconnected'}
             </span>
-            <span>❤️ {heartRate > 0 ? heartRate.toFixed(0) : '--'} BPM</span>
-            <span>⚡ PVCs: {pvcCount}</span>
-            <span>🫀 Beats: {detectedBeats}</span>
-            <span className={BurdenCalculator.getBurdenColor(burdenStats.burdenCategory as 'low' | 'moderate' | 'high')}>
-              📊 {BurdenCalculator.formatBurden(burdenStats.burden, burdenStats.confidence)} burden
-            </span>
-            <span className={BurdenCalculator.getConfidenceColor(burdenStats.confidence)}>
-              📈 Confidence: {(burdenStats.confidence * 100).toFixed(0)}%
-            </span>
+            
+            {/* ADDED: Training status display */}
+            {trainingStatus.isLearning ? (
+              <span className="text-yellow-400">🎓 Training: {trainingStatus.progress}/{trainingStatus.total}</span>
+            ) : (
+              <>
+                <span>❤️ {heartRate > 0 ? heartRate.toFixed(0) : '--'} BPM</span>
+                <span>⚡ PVCs: {pvcCount}</span>
+                <span>🫀 Beats: {detectedBeats}</span>
+                <span className={BurdenCalculator.getBurdenColor(burdenStats.burdenCategory as 'low' | 'moderate' | 'high')}>
+                  📊 {BurdenCalculator.formatBurden(burdenStats.burden, burdenStats.confidence)} burden
+                </span>
+                <span className={BurdenCalculator.getConfidenceColor(burdenStats.confidence)}>
+                  📈 Confidence: {(burdenStats.confidence * 100).toFixed(0)}%
+                </span>
+              </>
+            )}
           </div>
           <div className="flex items-center space-x-4">
             <span>📡 Signal: {(signalQuality * 100).toFixed(0)}%</span>
@@ -447,20 +501,61 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
           </div>
           
           <div className="text-sm text-gray-400">
-            Viewing: {currentViewStart.toFixed(1)}s - {(currentViewStart + timeWindow).toFixed(1)}s
-            {allTimeData.length > 0 && ` (Total: ${allTimeData[allTimeData.length - 1].toFixed(1)}s)`}
+            {trainingStatus.isLearning ? (
+              `Training in progress: ${trainingStatus.progress}/${trainingStatus.total} beats`
+            ) : (
+              <>
+                Viewing: {currentViewStart.toFixed(1)}s - {(currentViewStart + timeWindow).toFixed(1)}s
+                {allTimeData.length > 0 && ` (Total: ${allTimeData[allTimeData.length - 1].toFixed(1)}s)`}
+              </>
+            )}
           </div>
         </div>
       </div>
 
-      {/* ECG Chart with Enhanced PVC Overlay */}
+      {/* ECG Chart OR Training Message */}
       <div className="bg-black rounded-lg border border-gray-700 p-4 mb-4 relative" ref={chartContainerRef}>
         <div style={{ height: '400px' }}>
-          <Line ref={chartRef} data={chartData} options={chartOptions} />
+          {trainingStatus.isLearning ? (
+            // FIXED: Better training mode display
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center max-w-md mx-auto">
+                <div className="text-3xl text-yellow-400 mb-6">🎓 Morphology Training</div>
+                <div className="text-xl text-gray-300 mb-8">Learning your heartbeat pattern...</div>
+                
+                {/* FIXED: Better progress bar */}
+                <div className="w-full max-w-sm mx-auto mb-4">
+                  <div className="bg-gray-700 rounded-full h-6 overflow-hidden">
+                    <div 
+                      className="bg-gradient-to-r from-yellow-400 to-yellow-500 h-full rounded-full transition-all duration-500 ease-out flex items-center justify-center"
+                      style={{ width: `${(trainingStatus.progress / trainingStatus.total) * 100}%` }}
+                    >
+                      {trainingStatus.progress > 5 && (
+                        <span className="text-xs font-bold text-gray-900">
+                          {Math.round((trainingStatus.progress / trainingStatus.total) * 100)}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="text-lg font-medium text-white mb-2">
+                  {trainingStatus.progress}/{trainingStatus.total} beats collected
+                </div>
+                
+                <div className="text-sm text-gray-400">
+                  Stay still and breathe normally during training
+                </div>
+              </div>
+            </div>
+          ) : (
+            // Normal chart display
+            <Line ref={chartRef} data={chartData} options={chartOptions} />
+          )}
         </div>
         
-        {/* Enhanced PVC Overlay with Confidence-based Styling */}
-        {visiblePvcEvents.map((event, index) => (
+        {/* PVC Overlay - only show when not training */}
+        {!trainingStatus.isLearning && visiblePvcEvents.map((event, index) => (
           <div
             key={`pvc-${event.timestamp}-${index}`}
             style={getPvcOverlayStyle(event)}
@@ -523,8 +618,8 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
         </div>
       </div>
 
-      {/* New: Clinical Summary Panel */}
-      {detectedBeats > 50 && (
+      {/* Clinical Summary Panel - only show when not training */}
+      {!trainingStatus.isLearning && detectedBeats > 50 && (
         <div className="bg-gray-900 rounded-lg p-4 mt-4">
           <h3 className="text-lg font-semibold mb-3">📋 Clinical Summary</h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
@@ -552,3 +647,6 @@ export default function ECGChart({ isConnected, onConnectionChange }: ECGChartPr
     </div>
   )
 }
+)
+ECGChart.displayName = 'ECGChart'
+export default ECGChart
